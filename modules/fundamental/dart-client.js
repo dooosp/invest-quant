@@ -2,10 +2,12 @@ const axios = require('axios');
 const config = require('../../config');
 const { loadCache, saveCache } = require('../../utils/file-helper');
 const logger = require('../../utils/logger');
+const { CircuitBreaker } = require('../../utils/circuit-breaker');
 const path = require('path');
 
 const MOD = 'DART';
 const axiosInstance = axios.create({ timeout: 15000 });
+const dartCB = new CircuitBreaker('DART', { threshold: 3, resetTimeout: 30000 });
 
 // 종목코드 → DART 고유번호 캐시 (메모리)
 let corpCodeMap = null;
@@ -53,13 +55,15 @@ async function getCorpCode(stockCode) {
 
   // company API로 개별 조회
   try {
-    const response = await withRetry(() =>
-      axiosInstance.get(`${config.dart.baseUrl}/company.json`, {
-        params: {
-          crtfc_key: config.dart.apiKey,
-          stock_code: stockCode,
-        },
-      })
+    const response = await dartCB.call(() =>
+      withRetry(() =>
+        axiosInstance.get(`${config.dart.baseUrl}/company.json`, {
+          params: {
+            crtfc_key: config.dart.apiKey,
+            stock_code: stockCode,
+          },
+        })
+      )
     );
 
     if (response.data.status === '000') {
@@ -100,16 +104,18 @@ async function getFinancialStatements(stockCode, bsnsYear, reprtCode = '11011') 
   if (!corpCode) return null;
 
   try {
-    const response = await withRetry(() =>
-      axiosInstance.get(`${config.dart.baseUrl}/fnlttSinglAcntAll.json`, {
-        params: {
-          crtfc_key: config.dart.apiKey,
-          corp_code: corpCode,
-          bsns_year: bsnsYear,
-          reprt_code: reprtCode,
-          fs_div: 'CFS', // 연결재무제표
-        },
-      })
+    const response = await dartCB.call(() =>
+      withRetry(() =>
+        axiosInstance.get(`${config.dart.baseUrl}/fnlttSinglAcntAll.json`, {
+          params: {
+            crtfc_key: config.dart.apiKey,
+            corp_code: corpCode,
+            bsns_year: bsnsYear,
+            reprt_code: reprtCode,
+            fs_div: 'CFS', // 연결재무제표
+          },
+        })
+      )
     );
 
     if (response.data.status === '000') {
@@ -122,16 +128,18 @@ async function getFinancialStatements(stockCode, bsnsYear, reprtCode = '11011') 
     // 연결재무제표 없으면 개별재무제표 시도
     if (response.data.status === '013') {
       logger.warn(MOD, `연결재무제표 없음, 개별 시도: ${stockCode}`);
-      const response2 = await withRetry(() =>
-        axiosInstance.get(`${config.dart.baseUrl}/fnlttSinglAcntAll.json`, {
-          params: {
-            crtfc_key: config.dart.apiKey,
-            corp_code: corpCode,
-            bsns_year: bsnsYear,
-            reprt_code: reprtCode,
-            fs_div: 'OFS', // 개별재무제표
-          },
-        })
+      const response2 = await dartCB.call(() =>
+        withRetry(() =>
+          axiosInstance.get(`${config.dart.baseUrl}/fnlttSinglAcntAll.json`, {
+            params: {
+              crtfc_key: config.dart.apiKey,
+              corp_code: corpCode,
+              bsns_year: bsnsYear,
+              reprt_code: reprtCode,
+              fs_div: 'OFS', // 개별재무제표
+            },
+          })
+        )
       );
 
       if (response2.data.status === '000') {

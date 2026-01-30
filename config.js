@@ -32,6 +32,12 @@ const config = {
     timeout: 5000,
   },
 
+  // CORS 허용 origin (쉼표 구분으로 추가 가능)
+  cors: {
+    allowedOrigins: (process.env.CORS_ORIGINS || 'http://localhost:3001')
+      .split(',').map(s => s.trim()).filter(Boolean),
+  },
+
   // 펀더멘털 점수 가중치
   fundamental: {
     weights: {

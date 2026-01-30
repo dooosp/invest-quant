@@ -107,4 +107,4 @@ function fmt(v) {
   return v != null ? v.toFixed(2) : 'N/A';
 }
 
-module.exports = { calculateRatios };
+module.exports = { calculateRatios, _safeDiv: safeDiv, _safePct: safePct };

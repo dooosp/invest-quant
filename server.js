@@ -1,6 +1,8 @@
 require('dotenv').config();
 
 const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
 const config = require('./config');
 const { scoreFundamental } = require('./modules/fundamental/fundamental-scorer');
 const { fetchDailyCandles } = require('./modules/backtest/data-collector');
@@ -14,9 +16,19 @@ const { calculatePositionSize } = require('./modules/risk/position-sizer');
 const { adviseBuy, adviseSell } = require('./modules/integration/advisory-engine');
 const { loadData, saveData } = require('./utils/file-helper');
 const logger = require('./utils/logger');
+const authMiddleware = require('./middleware/auth');
+const { validateBuyInput, validateSellInput, validateBacktestInput, validatePortfolioInput } = require('./middleware/validate');
+const errorHandler = require('./middleware/error-handler');
 
 const app = express();
-app.use(express.json());
+app.use(helmet());
+app.use(cors({
+  origin: config.cors.allowedOrigins,
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'x-api-key', 'Authorization'],
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use('/api', authMiddleware);
 
 const MOD = 'Server';
 
@@ -56,12 +68,8 @@ app.get('/api/fundamental/:stockCode', async (req, res) => {
 });
 
 // --- 매수 종합 자문 (Phase 4: advisory-engine) ---
-app.post('/api/advisory/buy', async (req, res) => {
+app.post('/api/advisory/buy', validateBuyInput, async (req, res) => {
   const { stockCode } = req.body;
-
-  if (!stockCode || !/^\d{6}$/.test(stockCode)) {
-    return res.status(400).json({ error: '유효한 종목코드 필요' });
-  }
 
   try {
     const result = await adviseBuy(req.body);
@@ -70,20 +78,17 @@ app.post('/api/advisory/buy', async (req, res) => {
   } catch (error) {
     logger.error(MOD, `매수 자문 실패: ${stockCode}`, error);
     res.json({
-      approved: true, confidence: 0,
+      approved: false, confidence: 0,
       fundamentalScore: null, positionSize: null,
-      reason: 'InvestQuant 분석 실패 - fallback 통과',
+      reasonCode: 'ERROR_SAFE_DENY',
+      reason: '자문 처리 오류 — 안전 거부(수동 확인 필요)',
     });
   }
 });
 
 // --- 매도 종합 자문 (Phase 4: advisory-engine) ---
-app.post('/api/advisory/sell', async (req, res) => {
+app.post('/api/advisory/sell', validateSellInput, async (req, res) => {
   const { stockCode } = req.body;
-
-  if (!stockCode || !/^\d{6}$/.test(stockCode)) {
-    return res.status(400).json({ error: '유효한 종목코드 필요' });
-  }
 
   try {
     const result = await adviseSell(req.body);
@@ -91,18 +96,17 @@ app.post('/api/advisory/sell', async (req, res) => {
     res.json(result);
   } catch (error) {
     logger.error(MOD, `매도 자문 실패: ${stockCode}`, error);
-    res.json({ approved: true, reason: 'InvestQuant 분석 실패 - fallback 승인' });
+    res.json({
+      approved: false,
+      reasonCode: 'ERROR_SAFE_DENY',
+      reason: '매도 자문 오류 — 안전 거부(수동 확인 필요)',
+    });
   }
 });
 
 // --- 포트폴리오 리스크 분석 ---
-app.post('/api/risk/portfolio', async (req, res) => {
+app.post('/api/risk/portfolio', validatePortfolioInput, async (req, res) => {
   const { holdings, accountBalance } = req.body;
-  // holdings: [{code, name, quantity, avgPrice, currentPrice}]
-
-  if (!holdings || !Array.isArray(holdings) || holdings.length === 0) {
-    return res.status(400).json({ error: 'holdings 배열 필요' });
-  }
 
   try {
     // 1. 각 종목 일별 수익률 수집
@@ -148,12 +152,8 @@ app.post('/api/risk/portfolio', async (req, res) => {
 });
 
 // --- 백테스트 실행 ---
-app.post('/api/backtest/run', async (req, res) => {
+app.post('/api/backtest/run', validateBacktestInput, async (req, res) => {
   const { stockCode, days, strategyConfig, walkForward } = req.body;
-
-  if (!stockCode || !/^\d{6}$/.test(stockCode)) {
-    return res.status(400).json({ error: '유효한 종목코드 필요' });
-  }
 
   try {
     const candles = await fetchDailyCandles(stockCode, days || 365);
@@ -205,6 +205,9 @@ app.get('/api/backtest/results', (req, res) => {
 
   res.json({ results });
 });
+
+// --- 글로벌 에러 핸들러 (반드시 라우트 마지막에 등록) ---
+app.use(errorHandler);
 
 // --- 서버 시작 ---
 const PORT = config.server.port;
