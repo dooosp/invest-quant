@@ -1,0 +1,9 @@
+node_modules/
+.env
+data/fundamentals/*.json
+data/historical/*.json
+data/backtest-results/*.json
+data/risk-snapshots/*.json
+*.backup
+*.tmp.*
+*.corrupted.*
