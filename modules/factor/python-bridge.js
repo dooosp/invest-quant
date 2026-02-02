@@ -7,8 +7,8 @@ const path = require('path');
 const logger = require('../../utils/logger');
 
 const MOD = 'PyBridge';
-const PYTHON = 'python3';
 const PYTHON_DIR = path.join(__dirname, '..', '..', 'python');
+const PYTHON = path.join(PYTHON_DIR, '.venv', 'bin', 'python3');
 const TIMEOUT = 60000; // 60초
 
 function runPython(script, args = []) {
