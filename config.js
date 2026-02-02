@@ -90,6 +90,13 @@ const config = {
     confirmDays: 2,         // 국면 전환 확인 기간 (whipsaw 방지)
   },
 
+  // 퀀트 파이프라인 연동
+  pipeline: {
+    defaultStrategy: process.env.DEFAULT_STRATEGY || 'low_per_high_roe',
+    enforceWhitelist: process.env.ENFORCE_WHITELIST === 'true',
+    signalMaxAgeHours: parseInt(process.env.SIGNAL_MAX_AGE_HOURS) || 48,
+  },
+
   // 데이터 경로
   dataPath: {
     fundamentals: './data/fundamentals',

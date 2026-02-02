@@ -20,36 +20,48 @@ function loadLatestSignals() {
   if (signalCache.data && Date.now() - signalCache.loadedAt < SIGNAL_TTL_MS) {
     return signalCache.data;
   }
-  const runsDir = path.resolve(__dirname, '../../runs');
-  if (!fs.existsSync(runsDir)) return null;
-  const dirs = fs.readdirSync(runsDir).sort().reverse();
-  for (const dir of dirs) {
-    const sigPath = path.join(runsDir, dir, '..', '..', 'data/processed', dir.replace(/^\d{4}-\d{2}-\d{2}_/, ''), 'signals.csv');
-    const sigPath2 = path.resolve(__dirname, '../../data/processed');
-    // 가장 최근 signals.csv 찾기
-    if (fs.existsSync(sigPath2)) {
-      const subDirs = fs.readdirSync(sigPath2);
-      for (const sub of subDirs) {
-        const csv = path.join(sigPath2, sub, 'signals.csv');
-        if (fs.existsSync(csv)) {
-          const lines = fs.readFileSync(csv, 'utf-8').trim().split('\n');
-          const header = lines[0].split(',');
-          const map = {};
-          for (let i = 1; i < lines.length; i++) {
-            const cols = lines[i].split(',');
-            const code = cols[0];
-            const obj = {};
-            header.forEach((h, idx) => { obj[h] = cols[idx]; });
-            obj.composite_score = parseFloat(obj.composite_score) || 0;
-            obj.rank = parseInt(obj.rank) || 999;
-            map[code] = obj;
-          }
-          signalCache = { data: { map, total: lines.length - 1 }, loadedAt: Date.now() };
-          logger.info(MOD, `팩터 시그널 로드: ${lines.length - 1}종목`);
-          return signalCache.data;
-        }
-      }
+  const sigPath2 = path.resolve(__dirname, '../../data/processed');
+  if (!fs.existsSync(sigPath2)) return null;
+
+  const subDirs = fs.readdirSync(sigPath2);
+  for (const sub of subDirs) {
+    const csv = path.join(sigPath2, sub, 'signals.csv');
+    if (!fs.existsSync(csv)) continue;
+
+    // 신선도 계산 (mtime 기준)
+    const stat = fs.statSync(csv);
+    const ageMs = Date.now() - stat.mtimeMs;
+    const ageHours = ageMs / (1000 * 60 * 60);
+    const maxAge = config.pipeline?.signalMaxAgeHours || 48;
+    const isStale = ageHours > maxAge;
+
+    const lines = fs.readFileSync(csv, 'utf-8').trim().split('\n');
+    const header = lines[0].split(',');
+    const map = {};
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',');
+      const code = cols[0];
+      const obj = {};
+      header.forEach((h, idx) => { obj[h] = cols[idx]; });
+      obj.composite_score = parseFloat(obj.composite_score) || 0;
+      obj.rank = parseInt(obj.rank) || 999;
+      map[code] = obj;
     }
+
+    // 화이트리스트 (weights.json) 로드
+    const weightsPath = path.join(sigPath2, sub, 'weights.json');
+    let whitelist = null;
+    if (fs.existsSync(weightsPath)) {
+      try { whitelist = Object.keys(JSON.parse(fs.readFileSync(weightsPath, 'utf-8'))); }
+      catch { whitelist = null; }
+    }
+
+    signalCache = {
+      data: { map, total: lines.length - 1, ageHours: Math.round(ageHours * 10) / 10, isStale, whitelist },
+      loadedAt: Date.now(),
+    };
+    logger.info(MOD, `팩터 시그널 로드: ${lines.length - 1}종목 (${signalCache.data.ageHours}h, stale=${isStale})`);
+    return signalCache.data;
   }
   return null;
 }
@@ -156,18 +168,49 @@ async function adviseBuy(params) {
     else riskScore = 85;
   }
 
-  // --- 2b. 팩터 랭크 게이트 ---
+  // --- 2b. 팩터 랭크 게이트 (신선도 + 화이트리스트) ---
   let factorRank = null;
   let factorScore = null;
   const signals = loadLatestSignals();
   if (signals) {
+    // 신선도 체크
+    const maxAge = config.pipeline?.signalMaxAgeHours || 48;
+    if (signals.isStale) {
+      logger.info(MOD, `매수 차단: ${stockCode} — 시그널 ${signals.ageHours}h 경과 (>${maxAge}h)`);
+      return {
+        approved: false, confidence: 0, fundamentalScore,
+        positionSize: null, reasonCode: 'SIGNAL_TOO_OLD',
+        reason: `파이프라인 시그널 ${signals.ageHours}시간 경과 (기준: ${maxAge}h) — 재실행 필요`,
+        reasons: [...reasons, `시그널 경과: ${signals.ageHours}h`],
+      };
+    }
+    if (signals.ageHours > maxAge / 2) {
+      riskScore = Math.max(riskScore - 15, 0);
+      reasons.push(`시그널 ${signals.ageHours}h 경과 (감점 -15)`);
+    }
+
+    // 화이트리스트 체크
+    const enforce = config.pipeline?.enforceWhitelist || false;
+    if (enforce && signals.whitelist) {
+      if (!signals.whitelist.includes(stockCode)) {
+        logger.info(MOD, `매수 차단: ${stockCode} — 화이트리스트 미포함 (ENFORCE)`);
+        return {
+          approved: false, confidence: 0, fundamentalScore,
+          positionSize: null, reasonCode: 'NOT_IN_WHITELIST',
+          reason: `화이트리스트 미포함 (${signals.whitelist.length}종목 중 제외)`,
+          reasons: [...reasons, '화이트리스트 미포함'],
+        };
+      }
+      reasons.push(`화이트리스트 포함 (${signals.whitelist.length}종목)`);
+    }
+
+    // 팩터 랭크 감점 (기존 로직)
     const sig = signals.map[stockCode];
     if (sig) {
       factorRank = sig.rank;
       factorScore = sig.composite_score;
       const topHalf = Math.ceil(signals.total / 2);
       if (factorRank > topHalf) {
-        // 하위 50% — 신뢰도 감점 (거부는 아님)
         riskScore = Math.max(riskScore - 20, 0);
         reasons.push(`팩터 랭크 ${factorRank}/${signals.total} (하위권 감점 -20)`);
       } else {

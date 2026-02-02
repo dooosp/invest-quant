@@ -318,6 +318,38 @@ app.post('/api/regime/refresh', async (req, res) => {
   res.json({ refreshed: results, ...info, policy: getPolicy(info.regime) });
 });
 
+// --- 파이프라인 상태 + 시그널 신선도 ---
+app.get('/api/pipeline/status', (req, res) => {
+  const signals = loadLatestSignals();
+  // 최근 실행 결과
+  const runsDir = path2.resolve(__dirname, 'runs');
+  let latestRunStatus = null;
+  if (fs2.existsSync(runsDir)) {
+    const dirs = fs2.readdirSync(runsDir).sort().reverse();
+    for (const d of dirs) {
+      const sf = path2.join(runsDir, d, 'pipeline_status.json');
+      if (fs2.existsSync(sf)) {
+        latestRunStatus = JSON.parse(fs2.readFileSync(sf, 'utf-8'));
+        break;
+      }
+    }
+  }
+  res.json({
+    signal: signals ? {
+      totalStocks: signals.total,
+      ageHours: signals.ageHours,
+      isStale: signals.isStale,
+      whitelistCount: signals.whitelist ? signals.whitelist.length : null,
+    } : null,
+    latestRun: latestRunStatus,
+    config: {
+      defaultStrategy: config.pipeline.defaultStrategy,
+      enforceWhitelist: config.pipeline.enforceWhitelist,
+      signalMaxAgeHours: config.pipeline.signalMaxAgeHours,
+    },
+  });
+});
+
 // 모니터링 상태
 app.get('/api/monitor/status', (req, res) => {
   const autoTraderData = path2.resolve(__dirname, '..', 'auto-trader', 'data');
@@ -340,6 +372,23 @@ app.listen(PORT, () => {
   logger.info(MOD, `InvestQuant 서버 시작 - 포트 ${PORT}`);
   logger.info(MOD, `DART API: ${config.dart.apiKey ? '설정됨' : '미설정'}`);
   logger.info(MOD, `auto-trader 연동: ${config.autoTrader.baseUrl}`);
+
+  // 파이프라인 자동 실행: 매일 08:50 KST (장 개장 전)
+  cron.schedule('50 8 * * 1-5', async () => {
+    const strategy = config.pipeline.defaultStrategy;
+    const specPath = path2.resolve(__dirname, 'strategies', `${strategy}.json`);
+    if (!fs2.existsSync(specPath)) {
+      logger.warn(MOD, `[CRON] 파이프라인 스펙 없음: ${strategy}`);
+      return;
+    }
+    logger.info(MOD, `[CRON] 파이프라인 자동 실행: ${strategy}`);
+    try {
+      const status = await pipelineRunner.run(specPath);
+      logger.info(MOD, `[CRON] 파이프라인 완료: ${status.error ? 'FAIL' : 'OK'} (${status.duration_ms}ms)`);
+    } catch (e) {
+      logger.error(MOD, `[CRON] 파이프라인 오류: ${e.message}`);
+    }
+  }, { timezone: 'Asia/Seoul' });
 
   // 시장 지수 스케줄러: 매일 09:05 KST (장 개장 직후)
   cron.schedule('5 9 * * 1-5', () => {
