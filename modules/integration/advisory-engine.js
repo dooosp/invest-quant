@@ -1,12 +1,58 @@
+const fs = require('fs');
+const path = require('path');
 const config = require('../../config');
 const { scoreFundamental } = require('../fundamental/fundamental-scorer');
 const { fetchDailyCandles } = require('../backtest/data-collector');
 const { calculateVaR } = require('../risk/var-calculator');
 const { analyzeConcentration } = require('../risk/concentration');
 const { calculatePositionSize } = require('../risk/position-sizer');
+const { detectRegime } = require('../risk/regime-detector');
+const { getPolicy, checkBuyGate } = require('../risk/defense-policy');
 const logger = require('../../utils/logger');
 
 const MOD = 'Advisory';
+
+// 최신 파이프라인 시그널 캐시 (5분 TTL)
+let signalCache = { data: null, loadedAt: 0 };
+const SIGNAL_TTL_MS = 5 * 60 * 1000;
+
+function loadLatestSignals() {
+  if (signalCache.data && Date.now() - signalCache.loadedAt < SIGNAL_TTL_MS) {
+    return signalCache.data;
+  }
+  const runsDir = path.resolve(__dirname, '../../runs');
+  if (!fs.existsSync(runsDir)) return null;
+  const dirs = fs.readdirSync(runsDir).sort().reverse();
+  for (const dir of dirs) {
+    const sigPath = path.join(runsDir, dir, '..', '..', 'data/processed', dir.replace(/^\d{4}-\d{2}-\d{2}_/, ''), 'signals.csv');
+    const sigPath2 = path.resolve(__dirname, '../../data/processed');
+    // 가장 최근 signals.csv 찾기
+    if (fs.existsSync(sigPath2)) {
+      const subDirs = fs.readdirSync(sigPath2);
+      for (const sub of subDirs) {
+        const csv = path.join(sigPath2, sub, 'signals.csv');
+        if (fs.existsSync(csv)) {
+          const lines = fs.readFileSync(csv, 'utf-8').trim().split('\n');
+          const header = lines[0].split(',');
+          const map = {};
+          for (let i = 1; i < lines.length; i++) {
+            const cols = lines[i].split(',');
+            const code = cols[0];
+            const obj = {};
+            header.forEach((h, idx) => { obj[h] = cols[idx]; });
+            obj.composite_score = parseFloat(obj.composite_score) || 0;
+            obj.rank = parseInt(obj.rank) || 999;
+            map[code] = obj;
+          }
+          signalCache = { data: { map, total: lines.length - 1 }, loadedAt: Date.now() };
+          logger.info(MOD, `팩터 시그널 로드: ${lines.length - 1}종목`);
+          return signalCache.data;
+        }
+      }
+    }
+  }
+  return null;
+}
 
 // 신뢰도 가중치 (config에서 오버라이드 가능)
 const WEIGHTS = config.advisory?.weights || {
@@ -32,6 +78,22 @@ async function adviseBuy(params) {
   const { stockCode, currentPrice, technicalScore, holdings, accountBalance, marketCap, shares, winRate, avgWinLossRatio } = params;
   const reasons = [];
 
+  // --- 0. 시장 국면 게이트 ---
+  const regimeInfo = detectRegime();
+  const regime = regimeInfo.regime;
+  const policy = getPolicy(regime);
+  reasons.push(`시장국면: ${regime}`);
+
+  if (policy.buyGate === 'CLOSED') {
+    logger.info(MOD, `매수 차단: ${stockCode} — ${regime} 국면`);
+    return {
+      approved: false, confidence: 0, fundamentalScore: null,
+      regime, positionSize: null,
+      reason: `시장 국면 ${regime} — 신규매수 차단`,
+      reasons,
+    };
+  }
+
   // --- 1. 펀더멘털 ---
   let fundamentalScore = null;
   try {
@@ -43,7 +105,20 @@ async function adviseBuy(params) {
   }
 
   const minScore = config.fundamental.minScore;
-  if (fundamentalScore != null && fundamentalScore < minScore) {
+
+  // DART 실패 시 안전 거부 (펀더멘털 미검증 상태로 매수 불가)
+  if (fundamentalScore == null) {
+    logger.info(MOD, `매수 거부: ${stockCode} 펀더멘털 조회 불가 — 안전 거부`);
+    return {
+      approved: false, confidence: 0,
+      fundamentalScore: null, positionSize: null,
+      reasonCode: 'FUNDAMENTAL_UNAVAILABLE',
+      reason: '펀더멘털 조회 불가 — 안전 거부(수동 확인 필요)',
+      reasons,
+    };
+  }
+
+  if (fundamentalScore < minScore) {
     logger.info(MOD, `매수 거부: ${stockCode} 펀더멘털 ${fundamentalScore} < ${minScore}`);
     return {
       approved: false, confidence: fundamentalScore,
@@ -81,6 +156,26 @@ async function adviseBuy(params) {
     else riskScore = 85;
   }
 
+  // --- 2b. 팩터 랭크 게이트 ---
+  let factorRank = null;
+  let factorScore = null;
+  const signals = loadLatestSignals();
+  if (signals) {
+    const sig = signals.map[stockCode];
+    if (sig) {
+      factorRank = sig.rank;
+      factorScore = sig.composite_score;
+      const topHalf = Math.ceil(signals.total / 2);
+      if (factorRank > topHalf) {
+        // 하위 50% — 신뢰도 감점 (거부는 아님)
+        riskScore = Math.max(riskScore - 20, 0);
+        reasons.push(`팩터 랭크 ${factorRank}/${signals.total} (하위권 감점 -20)`);
+      } else {
+        reasons.push(`팩터 랭크 ${factorRank}/${signals.total} (상위권)`);
+      }
+    }
+  }
+
   // --- 3. 포지션 사이징 ---
   let positionSize = null;
   if (accountBalance && currentPrice) {
@@ -104,14 +199,33 @@ async function adviseBuy(params) {
     fNorm * WEIGHTS.fundamental + tNorm * WEIGHTS.technical + riskScore * WEIGHTS.risk
   );
 
-  logger.info(MOD, `매수 승인: ${stockCode} 신뢰도 ${confidence} (F:${fNorm} T:${tNorm} R:${riskScore}) 포지션:${positionSize || 'N/A'}`);
+  // --- 5. 국면별 매수 게이트 (RESTRICTED 체크) ---
+  const gateResult = checkBuyGate(regime, confidence);
+  if (!gateResult.allowed) {
+    logger.info(MOD, `매수 거부: ${stockCode} — ${gateResult.reason}`);
+    return {
+      approved: false, confidence, fundamentalScore, factorRank, factorScore,
+      regime, positionSize: null, reason: gateResult.reason, reasons,
+    };
+  }
+
+  // 국면별 포지션 축소
+  if (positionSize != null) {
+    positionSize = Math.round(positionSize * policy.positionMultiplier);
+    if (policy.positionMultiplier < 1) reasons.push(`국면 포지션 축소 ×${policy.positionMultiplier}`);
+  }
+
+  logger.info(MOD, `매수 승인: ${stockCode} 신뢰도 ${confidence} 국면:${regime} (F:${fNorm} T:${tNorm} R:${riskScore}) 포지션:${positionSize || 'N/A'}`);
 
   return {
     approved: true,
     confidence,
     fundamentalScore,
+    factorRank,
+    factorScore,
+    regime,
     positionSize,
-    reason: `종합 신뢰도 ${confidence}점 (펀더멘털 ${fNorm} × ${WEIGHTS.fundamental} + 기술 ${tNorm} × ${WEIGHTS.technical} + 리스크 ${riskScore} × ${WEIGHTS.risk})`,
+    reason: `종합 신뢰도 ${confidence}점 (펀더멘털 ${fNorm} × ${WEIGHTS.fundamental} + 기술 ${tNorm} × ${WEIGHTS.technical} + 리스크 ${riskScore} × ${WEIGHTS.risk}) [${regime}]`,
     reasons,
   };
 }
@@ -165,4 +279,4 @@ async function adviseSell(params) {
   };
 }
 
-module.exports = { adviseBuy, adviseSell };
+module.exports = { adviseBuy, adviseSell, loadLatestSignals };

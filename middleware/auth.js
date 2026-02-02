@@ -1,36 +1,29 @@
 'use strict';
 const crypto = require('crypto');
 
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
+function timingSafeEqualStr(a, b) {
+  const aa = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
 }
 
 module.exports = function authMiddleware(req, res, next) {
   const apiKey = process.env.INVEST_QUANT_API_KEY;
-  const env = process.env.NODE_ENV || 'development';
 
-  // 개발 환경에서만 키 미설정 bypass
+  // 환경과 무관하게 인증은 항상 켬 (운영 사고 방지)
   if (!apiKey) {
-    if (env === 'development') return next();
     return res.status(500).json({
       error: 'ServerMisconfigured',
       message: 'INVEST_QUANT_API_KEY 미설정',
     });
   }
 
-  const headerKey = req.headers['x-api-key'];
-  const bearer = req.headers['authorization'];
   const provided =
-    (typeof headerKey === 'string' && headerKey) ||
-    (typeof bearer === 'string' && bearer.startsWith('Bearer ')
-      ? bearer.slice(7)
-      : '');
+    req.headers['x-api-key'] ||
+    (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
 
-  if (!provided || !safeEqual(provided, apiKey)) {
+  if (!provided || !timingSafeEqualStr(provided, apiKey)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();

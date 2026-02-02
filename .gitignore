@@ -7,3 +7,7 @@ data/risk-snapshots/*.json
 *.backup
 *.tmp.*
 *.corrupted.*
+runs/
+data/raw/
+data/processed/
+__pycache__

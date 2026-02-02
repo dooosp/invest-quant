@@ -82,6 +82,14 @@ const config = {
     '003550': 'TECH',
   },
 
+  // 하락장 방어 정책
+  defense: {
+    volThreshold: 25,       // 20일 실현변동성 BEAR 기준 (연환산 %)
+    momThreshold: -10,      // 60일 모멘텀 BEAR 기준 (%)
+    bearMinConfidence: 70,  // BEAR 국면 매수 최소 신뢰도
+    confirmDays: 2,         // 국면 전환 확인 기간 (whipsaw 방지)
+  },
+
   // 데이터 경로
   dataPath: {
     fundamentals: './data/fundamentals',

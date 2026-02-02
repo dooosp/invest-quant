@@ -1,4 +1,5 @@
 const axios = require('axios');
+const AdmZip = require('adm-zip');
 const config = require('../../config');
 const { loadCache, saveCache } = require('../../utils/file-helper');
 const logger = require('../../utils/logger');
@@ -25,7 +26,8 @@ async function withRetry(fn, maxRetries = 3) {
 
       if (!retryable || attempt === maxRetries) throw error;
 
-      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+      const base = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+      const delay = base + Math.floor(Math.random() * base * 0.3);
       logger.warn(MOD, `재시도 ${attempt}/${maxRetries} (status=${status}, wait=${delay}ms)`);
       await new Promise(r => setTimeout(r, delay));
     }
@@ -33,19 +35,54 @@ async function withRetry(fn, maxRetries = 3) {
 }
 
 /**
+ * corpCode.xml ZIP 다운로드 → stock_code:corp_code 매핑 빌드
+ */
+async function downloadCorpCodeMap() {
+  logger.info(MOD, 'corpCode.xml ZIP 다운로드 시작');
+  const response = await axiosInstance.get(
+    `${config.dart.baseUrl}/corpCode.xml`,
+    { params: { crtfc_key: config.dart.apiKey }, responseType: 'arraybuffer', timeout: 60000 }
+  );
+
+  const zip = new AdmZip(Buffer.from(response.data));
+  const entry = zip.getEntries().find(e => e.entryName.endsWith('.xml'));
+  if (!entry) throw new Error('corpCode.xml not found in ZIP');
+
+  const xml = entry.getData().toString('utf-8');
+  const map = {};
+  // 멀티라인 XML: <list> 블록 단위로 파싱
+  const blockRegex = /<list>[\s\S]*?<\/list>/g;
+  let block;
+  while ((block = blockRegex.exec(xml)) !== null) {
+    const cc = block[0].match(/<corp_code>(\d+)<\/corp_code>/);
+    const sc = block[0].match(/<stock_code>\s*(\d+)\s*<\/stock_code>/);
+    if (cc && sc) map[sc[1]] = cc[1];
+  }
+
+  logger.info(MOD, `corpCode 매핑 완료: ${Object.keys(map).length}개 상장사`);
+  return map;
+}
+
+/**
  * 종목코드 → DART 고유번호 변환
  * DART API는 corp_code(고유번호)를 사용하므로 변환 필요
  */
 async function getCorpCode(stockCode) {
-  if (!corpCodeMap) {
-    const cachePath = path.join(config.dataPath.fundamentals, '_corp_codes.json');
-    const cached = loadCache(cachePath, 30); // 30일 캐시
+  const cachePath = path.join(config.dataPath.fundamentals, '_corp_codes.json');
 
-    if (cached && cached.map) {
+  if (!corpCodeMap) {
+    const cached = loadCache(cachePath, 30); // 30일 캐시
+    if (cached && cached.map && Object.keys(cached.map).length > 100) {
       corpCodeMap = cached.map;
     } else {
-      // DART corpCode.xml은 ZIP으로 제공 → 대안: company API로 개별 조회
-      corpCodeMap = {};
+      // corpCode.xml ZIP 다운로드로 전체 매핑 구축
+      try {
+        corpCodeMap = await downloadCorpCodeMap();
+        saveCache(cachePath, { map: corpCodeMap });
+      } catch (error) {
+        logger.error(MOD, 'corpCode.xml 다운로드 실패', error);
+        corpCodeMap = {};
+      }
     }
   }
 
@@ -53,35 +90,8 @@ async function getCorpCode(stockCode) {
     return corpCodeMap[stockCode];
   }
 
-  // company API로 개별 조회
-  try {
-    const response = await dartCB.call(() =>
-      withRetry(() =>
-        axiosInstance.get(`${config.dart.baseUrl}/company.json`, {
-          params: {
-            crtfc_key: config.dart.apiKey,
-            stock_code: stockCode,
-          },
-        })
-      )
-    );
-
-    if (response.data.status === '000') {
-      const corpCode = response.data.corp_code;
-      corpCodeMap[stockCode] = corpCode;
-
-      // 캐시 저장
-      const cachePath = path.join(config.dataPath.fundamentals, '_corp_codes.json');
-      saveCache(cachePath, { map: corpCodeMap });
-
-      return corpCode;
-    }
-    logger.warn(MOD, `기업 정보 없음: ${stockCode} (${response.data.message})`);
-    return null;
-  } catch (error) {
-    logger.error(MOD, `기업 정보 조회 실패: ${stockCode}`, error);
-    return null;
-  }
+  logger.warn(MOD, `corp_code 없음: ${stockCode} (비상장 또는 매핑 누락)`);
+  return null;
 }
 
 /**

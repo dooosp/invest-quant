@@ -13,6 +13,7 @@ let accessToken = null;
 let tokenExpiry = null;
 let tokenPromise = null;
 
+
 async function getAccessToken() {
   if (accessToken && tokenExpiry && new Date() < tokenExpiry) return accessToken;
   // 동시 요청 시 중복 발급 방지 (Promise singleton lock)
@@ -100,14 +101,19 @@ async function fetchDailyCandles(stockCode, days = 365) {
     const candles = output
       .slice(0, days)
       .reverse()
-      .map(item => ({
-        date: item.stck_bsop_date,
-        open: parseInt(item.stck_oprc),
-        high: parseInt(item.stck_hgpr),
-        low: parseInt(item.stck_lwpr),
-        close: parseInt(item.stck_clpr),
-        volume: parseInt(item.acml_vol),
-      }));
+      .map(item => {
+        const close = safeIntOrNull(item.stck_clpr);
+        if (close == null || close <= 0) return null;
+        return {
+          date: item.stck_bsop_date,
+          open: safeIntOrNull(item.stck_oprc) ?? close,
+          high: safeIntOrNull(item.stck_hgpr) ?? close,
+          low: safeIntOrNull(item.stck_lwpr) ?? close,
+          close,
+          volume: safeIntOrNull(item.acml_vol) ?? 0,
+        };
+      })
+      .filter(Boolean);
 
     saveCache(cachePath, { candles });
     logger.info(MOD, `데이터 수집: ${stockCode} (${candles.length}봉)`);
@@ -118,8 +124,62 @@ async function fetchDailyCandles(stockCode, days = 365) {
   }
 }
 
+/**
+ * 지수(KOSPI/KOSDAQ) 일봉 수집 — 네이버 금융 공개 API
+ * @param {string} symbol - 'KOSPI' 또는 'KOSDAQ'
+ * @param {number} days - 조회 일수
+ * @returns {Array} [{date, open, high, low, close, volume}]
+ */
+async function fetchIndexCandles(symbol = 'KOSPI', days = 120) {
+  const name = symbol.toLowerCase();
+  const cachePath = path.join(config.dataPath.historical, `${name}_daily.json`);
+  const cached = loadCache(cachePath, 1);
+  if (cached && cached.candles && cached.candles.length > 0) {
+    logger.info(MOD, `지수 캐시 사용: ${name} (${cached.candles.length}봉)`);
+    return cached.candles;
+  }
+
+  const url = `https://fchart.stock.naver.com/sise.nhn?symbol=${symbol}&timeframe=day&count=${days}&requestType=0`;
+
+  try {
+    const response = await axiosInstance.get(url, { responseType: 'text' });
+    const xml = response.data;
+
+    // XML 파싱: <item data="YYYYMMDD|open|high|low|close|volume" />
+    const items = [];
+    const regex = /<item\s+data="([^"]+)"\s*\/>/g;
+    let match;
+    while ((match = regex.exec(xml)) !== null) {
+      const parts = match[1].split('|');
+      if (parts.length < 6) continue;
+      const close = parseFloat(parts[4]);
+      if (!Number.isFinite(close) || close <= 0) continue;
+      items.push({
+        date: parts[0],
+        open: parseFloat(parts[1]) || close,
+        high: parseFloat(parts[2]) || close,
+        low: parseFloat(parts[3]) || close,
+        close,
+        volume: parseInt(parts[5]) || 0,
+      });
+    }
+
+    saveCache(cachePath, { candles: items });
+    logger.info(MOD, `지수 수집: ${name} (${items.length}봉) [네이버금융]`);
+    return items;
+  } catch (error) {
+    logger.error(MOD, `지수 수집 실패: ${name}`, error);
+    return [];
+  }
+}
+
+function safeIntOrNull(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 function delay(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { fetchDailyCandles };
+module.exports = { fetchDailyCandles, fetchIndexCandles };

@@ -5,7 +5,8 @@ const helmet = require('helmet');
 const cors = require('cors');
 const config = require('./config');
 const { scoreFundamental } = require('./modules/fundamental/fundamental-scorer');
-const { fetchDailyCandles } = require('./modules/backtest/data-collector');
+const { fetchDailyCandles, fetchIndexCandles } = require('./modules/backtest/data-collector');
+const cron = require('node-cron');
 const { runBacktest } = require('./modules/backtest/strategy-engine');
 const { calculatePerformance } = require('./modules/backtest/performance-calc');
 const { walkForwardValidation } = require('./modules/backtest/walk-forward');
@@ -13,12 +14,14 @@ const { calculateVaR, calculatePortfolioVaR } = require('./modules/risk/var-calc
 const { buildCorrelationMatrix } = require('./modules/risk/correlation');
 const { analyzeConcentration } = require('./modules/risk/concentration');
 const { calculatePositionSize } = require('./modules/risk/position-sizer');
-const { adviseBuy, adviseSell } = require('./modules/integration/advisory-engine');
+const { adviseBuy, adviseSell, loadLatestSignals } = require('./modules/integration/advisory-engine');
 const { loadData, saveData } = require('./utils/file-helper');
 const logger = require('./utils/logger');
 const authMiddleware = require('./middleware/auth');
 const { validateBuyInput, validateSellInput, validateBacktestInput, validatePortfolioInput } = require('./middleware/validate');
 const errorHandler = require('./middleware/error-handler');
+const { asyncPool } = require('./utils/pool');
+const { RateLimiter } = require('./utils/rate-limiter');
 
 const app = express();
 app.use(helmet());
@@ -29,6 +32,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', authMiddleware);
+app.use('/api', new RateLimiter({ windowMs: 60000, max: 30 }).middleware());
 
 const MOD = 'Server';
 
@@ -109,10 +113,14 @@ app.post('/api/risk/portfolio', validatePortfolioInput, async (req, res) => {
   const { holdings, accountBalance } = req.body;
 
   try {
-    // 1. 각 종목 일별 수익률 수집
+    // 1. 각 종목 일별 수익률 수집 (동시성 제한 병렬)
+    const limit = Number(process.env.KIS_CONCURRENCY) || 6;
+    const candleResults = await asyncPool(limit, holdings, h => fetchDailyCandles(h.code, 120));
+
     const stocksData = [];
-    for (const h of holdings) {
-      const candles = await fetchDailyCandles(h.code, 120);
+    for (let idx = 0; idx < holdings.length; idx++) {
+      const h = holdings[idx];
+      const candles = candleResults[idx].status === 'fulfilled' ? candleResults[idx].value : [];
       if (candles.length < 20) continue;
       const closes = candles.map(c => c.close);
       const dailyReturns = [];
@@ -206,6 +214,123 @@ app.get('/api/backtest/results', (req, res) => {
   res.json({ results });
 });
 
+// --- 팩터 랭크 조회 ---
+app.get('/api/factor-rank/:stockCode', (req, res) => {
+  const { stockCode } = req.params;
+  if (!/^\d{6}$/.test(stockCode)) {
+    return res.status(400).json({ error: '종목코드는 6자리 숫자' });
+  }
+  const signals = loadLatestSignals();
+  if (!signals) return res.status(404).json({ error: '파이프라인 시그널 없음' });
+  const sig = signals.map[stockCode];
+  if (!sig) return res.status(404).json({ error: `${stockCode} 시그널 없음` });
+  res.json({ stockCode, rank: sig.rank, total: signals.total, compositeScore: sig.composite_score, factors: sig });
+});
+
+// --- 퀀트 파이프라인 API ---
+const pipelineRunner = require('./modules/integration/pipeline-runner');
+const monitor = require('./modules/monitor/monitor-agent');
+const fs2 = require('fs');
+const path2 = require('path');
+
+// 파이프라인 실행
+app.post('/api/pipeline/run', async (req, res) => {
+  try {
+    const { strategy } = req.body;
+    const specPath = path2.resolve(__dirname, 'strategies', `${strategy}.json`);
+    if (!fs2.existsSync(specPath)) {
+      return res.status(404).json({ error: `전략 스펙 없음: ${strategy}` });
+    }
+    const status = await pipelineRunner.run(specPath);
+    res.json(status);
+  } catch (error) {
+    logger.error(MOD, `파이프라인 실패: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 파이프라인 결과 조회
+app.get('/api/pipeline/results/:runId', (req, res) => {
+  const runDir = path2.resolve(__dirname, 'runs', req.params.runId);
+  const statusFile = path2.join(runDir, 'pipeline_status.json');
+  if (!fs2.existsSync(statusFile)) return res.status(404).json({ error: 'Run not found' });
+  const status = JSON.parse(fs2.readFileSync(statusFile, 'utf-8'));
+  const resultFile = path2.join(runDir, 'run_result.json');
+  const result = fs2.existsSync(resultFile) ? JSON.parse(fs2.readFileSync(resultFile, 'utf-8')) : null;
+  res.json({ status, result });
+});
+
+// 전략 목록
+app.get('/api/strategies', (req, res) => {
+  const dir = path2.resolve(__dirname, 'strategies');
+  if (!fs2.existsSync(dir)) return res.json({ strategies: [] });
+  const files = fs2.readdirSync(dir).filter(f => f.endsWith('.json'));
+  const strategies = files.map(f => {
+    try { return JSON.parse(fs2.readFileSync(path2.join(dir, f), 'utf-8')); }
+    catch { return { name: f.replace('.json', '') }; }
+  });
+  res.json({ strategies });
+});
+
+// 전략 등록
+app.post('/api/strategies', (req, res) => {
+  const spec = req.body;
+  if (!spec.name) return res.status(400).json({ error: 'name 필수' });
+  const dir = path2.resolve(__dirname, 'strategies');
+  fs2.mkdirSync(dir, { recursive: true });
+  fs2.writeFileSync(path2.join(dir, `${spec.name}.json`), JSON.stringify(spec, null, 2));
+  res.json({ status: 'ok', name: spec.name });
+});
+
+// --- 시장 지수 수집 + 국면 갱신 ---
+async function refreshMarketData() {
+  const { clearCache } = require('./modules/risk/regime-detector');
+  const results = {};
+  for (const sym of ['KOSPI', 'KOSDAQ']) {
+    try {
+      const candles = await fetchIndexCandles(sym, 120);
+      results[sym] = candles.length;
+      logger.info(MOD, `${sym} 데이터 갱신: ${candles.length}봉`);
+    } catch (e) {
+      results[sym] = 0;
+      logger.error(MOD, `${sym} 갱신 실패: ${e.message}`);
+    }
+  }
+  clearCache();
+  return results;
+}
+
+// 시장 국면 조회
+app.get('/api/regime/status', (req, res) => {
+  const { detectRegime } = require('./modules/risk/regime-detector');
+  const { getPolicy } = require('./modules/risk/defense-policy');
+  const info = detectRegime();
+  const policy = getPolicy(info.regime);
+  res.json({ ...info, policy });
+});
+
+// 시장 지수 수동 갱신 + 국면 재계산
+app.post('/api/regime/refresh', async (req, res) => {
+  const results = await refreshMarketData();
+  const { detectRegime } = require('./modules/risk/regime-detector');
+  const { getPolicy } = require('./modules/risk/defense-policy');
+  const info = detectRegime();
+  res.json({ refreshed: results, ...info, policy: getPolicy(info.regime) });
+});
+
+// 모니터링 상태
+app.get('/api/monitor/status', (req, res) => {
+  const autoTraderData = path2.resolve(__dirname, '..', 'auto-trader', 'data');
+  const runsDir = path2.resolve(__dirname, 'runs');
+  let latestRun = null;
+  if (fs2.existsSync(runsDir)) {
+    const dirs = fs2.readdirSync(runsDir).sort().reverse();
+    if (dirs.length > 0) latestRun = path2.join(runsDir, dirs[0]);
+  }
+  const status = monitor.getStatus(autoTraderData, latestRun);
+  res.json(status);
+});
+
 // --- 글로벌 에러 핸들러 (반드시 라우트 마지막에 등록) ---
 app.use(errorHandler);
 
@@ -215,6 +340,21 @@ app.listen(PORT, () => {
   logger.info(MOD, `InvestQuant 서버 시작 - 포트 ${PORT}`);
   logger.info(MOD, `DART API: ${config.dart.apiKey ? '설정됨' : '미설정'}`);
   logger.info(MOD, `auto-trader 연동: ${config.autoTrader.baseUrl}`);
+
+  // 시장 지수 스케줄러: 매일 09:05 KST (장 개장 직후)
+  cron.schedule('5 9 * * 1-5', () => {
+    logger.info(MOD, '[CRON] 시장 지수(KOSPI/KOSDAQ) 자동 수집 시작');
+    refreshMarketData();
+  }, { timezone: 'Asia/Seoul' });
+
+  // 서버 시작 시 지수 데이터 없으면 즉시 수집
+  const fs = require('fs');
+  const histDir = require('path').resolve(__dirname, 'data/historical');
+  const needRefresh = ['kospi_daily.json', 'kosdaq_daily.json'].some(f => !fs.existsSync(require('path').join(histDir, f)));
+  if (needRefresh) {
+    logger.info(MOD, '시장 지수 데이터 부족 → 즉시 수집');
+    refreshMarketData();
+  }
 });
 
 module.exports = app;

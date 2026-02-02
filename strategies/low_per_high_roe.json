@@ -1,0 +1,30 @@
+{
+  "name": "low_per_high_roe",
+  "universe": {
+    "market": "KR",
+    "liquidity_filter": "top_70pct",
+    "exclude": ["SPAC", "ETF", "REIT", "preferred"]
+  },
+  "rebalance": { "freq": "M", "day_rule": "first_trading_day" },
+  "factors": [
+    { "id": "value_per", "type": "ratio", "formula": "1/PER", "winsorize": [0.01, 0.99] },
+    { "id": "quality_roe", "type": "ratio", "formula": "ROE", "zscore": true },
+    { "id": "mom_60d", "type": "price_momentum", "lookback": 60, "skip": 5 }
+  ],
+  "signal": {
+    "method": "rank_sum",
+    "weights": { "value_per": 0.3, "quality_roe": 0.3, "mom_60d": 0.4 }
+  },
+  "portfolio": {
+    "method": "top_n_equal",
+    "n": 20,
+    "max_weight": 0.08,
+    "sector_cap": 0.25
+  },
+  "cost_model": { "fee_bps": 3, "slippage_bps": 5 },
+  "risk_limits": {
+    "max_turnover": 0.6,
+    "max_drawdown_stop": 0.25,
+    "daily_loss_limit": 0.03
+  }
+}
