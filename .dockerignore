@@ -1,0 +1,9 @@
+node_modules
+.env
+.git
+data/
+python/.venv
+runs/
+docs/
+__tests__
+*.md
