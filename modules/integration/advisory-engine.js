@@ -3,7 +3,6 @@ const path = require('path');
 const config = require('../../config');
 const { scoreFundamental } = require('../fundamental/fundamental-scorer');
 const { fetchDailyCandles } = require('../backtest/data-collector');
-const { calculateVaR } = require('../risk/var-calculator');
 const { analyzeConcentration } = require('../risk/concentration');
 const { calculatePositionSize } = require('../risk/position-sizer');
 const { detectRegime } = require('../risk/regime-detector');
@@ -68,10 +67,37 @@ function loadLatestSignals() {
 
 // 신뢰도 가중치 (config에서 오버라이드 가능)
 const WEIGHTS = config.advisory?.weights || {
-  fundamental: 0.4,
-  technical: 0.3,
-  risk: 0.3,
+  fundamental: 0.35,
+  technical: 0.25,
+  risk: 0.25,
+  news: 0.15,
 };
+
+// 뉴스 센티먼트 캐시 (파일 기반)
+let newsSentimentCache = { data: null, loadedAt: 0 };
+const NEWS_CACHE_TTL = config.advisory?.newsSentimentTTL || 6 * 60 * 60 * 1000;
+
+function loadNewsSentiment(stockCode) {
+  const now = Date.now();
+  if (!newsSentimentCache.data || now - newsSentimentCache.loadedAt > 60000) {
+    const sentPath = config.advisory?.newsSentimentPath;
+    if (sentPath && fs.existsSync(sentPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(sentPath, 'utf8'));
+        const fileAge = now - new Date(raw.timestamp).getTime();
+        if (fileAge <= NEWS_CACHE_TTL) {
+          newsSentimentCache = { data: raw.stocks || {}, loadedAt: now };
+        } else {
+          newsSentimentCache = { data: null, loadedAt: now };
+        }
+      } catch (_e) {
+        newsSentimentCache = { data: null, loadedAt: now };
+      }
+    }
+  }
+  if (!newsSentimentCache.data) return null;
+  return newsSentimentCache.data[stockCode] || null;
+}
 
 /**
  * 매수 종합 자문
@@ -112,7 +138,7 @@ async function adviseBuy(params) {
     const fResult = await scoreFundamental(stockCode, marketCap || null, shares || null);
     fundamentalScore = fResult.score;
     if (fResult.reasons) reasons.push(...fResult.reasons);
-  } catch (e) {
+  } catch (_e) {
     logger.warn(MOD, `펀더멘털 조회 실패: ${stockCode}`);
   }
 
@@ -235,14 +261,23 @@ async function adviseBuy(params) {
     if (sizing.reasons) reasons.push(...sizing.reasons);
   }
 
-  // --- 4. 종합 신뢰도 ---
+  // --- 4. 뉴스 센티먼트 ---
+  let newsScore = 50; // 기본값 (중립)
+  const newsData = loadNewsSentiment(stockCode);
+  if (newsData) {
+    newsScore = newsData.newsScore != null ? newsData.newsScore : 50;
+    reasons.push(`뉴스 센티먼트: ${newsData.sentiment || 'N/A'} (${newsScore}점)`);
+  }
+
+  // --- 5. 종합 신뢰도 ---
   const fNorm = fundamentalScore != null ? fundamentalScore : 50;
   const tNorm = technicalScore != null ? technicalScore : 50;
+  const newsWeight = WEIGHTS.news || 0;
   const confidence = Math.round(
-    fNorm * WEIGHTS.fundamental + tNorm * WEIGHTS.technical + riskScore * WEIGHTS.risk
+    fNorm * WEIGHTS.fundamental + tNorm * WEIGHTS.technical + riskScore * WEIGHTS.risk + newsScore * newsWeight
   );
 
-  // --- 5. 국면별 매수 게이트 (RESTRICTED 체크) ---
+  // --- 6. 국면별 매수 게이트 (RESTRICTED 체크) ---
   const gateResult = checkBuyGate(regime, confidence);
   if (!gateResult.allowed) {
     logger.info(MOD, `매수 거부: ${stockCode} — ${gateResult.reason}`);
@@ -258,7 +293,7 @@ async function adviseBuy(params) {
     if (policy.positionMultiplier < 1) reasons.push(`국면 포지션 축소 ×${policy.positionMultiplier}`);
   }
 
-  logger.info(MOD, `매수 승인: ${stockCode} 신뢰도 ${confidence} 국면:${regime} (F:${fNorm} T:${tNorm} R:${riskScore}) 포지션:${positionSize || 'N/A'}`);
+  logger.info(MOD, `매수 승인: ${stockCode} 신뢰도 ${confidence} 국면:${regime} (F:${fNorm} T:${tNorm} R:${riskScore} N:${newsScore}) 포지션:${positionSize || 'N/A'}`);
 
   return {
     approved: true,
@@ -266,9 +301,10 @@ async function adviseBuy(params) {
     fundamentalScore,
     factorRank,
     factorScore,
+    newsScore,
     regime,
     positionSize,
-    reason: `종합 신뢰도 ${confidence}점 (펀더멘털 ${fNorm} × ${WEIGHTS.fundamental} + 기술 ${tNorm} × ${WEIGHTS.technical} + 리스크 ${riskScore} × ${WEIGHTS.risk}) [${regime}]`,
+    reason: `종합 신뢰도 ${confidence}점 (펀더멘털 ${fNorm}×${WEIGHTS.fundamental} + 기술 ${tNorm}×${WEIGHTS.technical} + 리스크 ${riskScore}×${WEIGHTS.risk} + 뉴스 ${newsScore}×${newsWeight}) [${regime}]`,
     reasons,
   };
 }
@@ -284,7 +320,7 @@ async function adviseBuy(params) {
  * @param {boolean} params.isUrgent - 긴급매도 여부
  */
 async function adviseSell(params) {
-  const { stockCode, currentPrice, avgPrice, profitRate, reason, isUrgent } = params;
+  const { stockCode, currentPrice: _currentPrice, avgPrice: _avgPrice, profitRate, reason, isUrgent } = params;
 
   // 긴급매도 → 항상 승인 (bypass)
   if (isUrgent) {
@@ -305,7 +341,7 @@ async function adviseSell(params) {
       sellRecommendation = 'SELL';
       reasons.push(`펀더멘털 약화 (${fResult.score}점)`);
     }
-  } catch (e) {
+  } catch (_e) {
     // 실패 시 기술적 신호 존중
   }
 

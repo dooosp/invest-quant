@@ -1,4 +1,5 @@
 require('dotenv').config();
+const path = require('path');
 
 const config = {
   // DART API
@@ -52,10 +53,14 @@ const config = {
   // 종합 자문 가중치
   advisory: {
     weights: {
-      fundamental: 0.4,  // 펀더멘털 비중
-      technical: 0.3,     // 기술적 비중
-      risk: 0.3,          // 리스크 비중
+      fundamental: 0.35,  // 펀더멘털 비중
+      technical: 0.25,    // 기술적 비중
+      risk: 0.25,         // 리스크 비중
+      news: 0.15,         // 뉴스 센티먼트 비중
     },
+    newsSentimentPath: process.env.NEWS_SENTIMENT_CACHE
+      || path.join(__dirname, '..', 'invest-intelligence-loop', 'data', 'sentiment-cache.json'),
+    newsSentimentTTL: 6 * 60 * 60 * 1000, // 6시간
   },
 
   // 섹터 매핑 (auto-trader와 동일)
