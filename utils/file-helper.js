@@ -14,7 +14,7 @@ function loadData(filePath) {
       const content = fs.readFileSync(fullPath, 'utf8');
       return JSON.parse(content);
     }
-  } catch (error) {
+  } catch (_error) {
     console.error(`[FileHelper] 파일 손상: ${filePath}`);
     if (fs.existsSync(backupPath)) {
       try {
@@ -23,7 +23,7 @@ function loadData(filePath) {
         fs.writeFileSync(fullPath, backupContent, 'utf8');
         console.log(`[FileHelper] 백업에서 복구: ${filePath}`);
         return data;
-      } catch (e) {
+      } catch (_e) {
         console.error(`[FileHelper] 백업도 손상: ${filePath}`);
       }
     }

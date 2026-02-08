@@ -10,12 +10,11 @@ const cron = require('node-cron');
 const { runBacktest } = require('./modules/backtest/strategy-engine');
 const { calculatePerformance } = require('./modules/backtest/performance-calc');
 const { walkForwardValidation } = require('./modules/backtest/walk-forward');
-const { calculateVaR, calculatePortfolioVaR } = require('./modules/risk/var-calculator');
+const { calculatePortfolioVaR } = require('./modules/risk/var-calculator');
 const { buildCorrelationMatrix } = require('./modules/risk/correlation');
 const { analyzeConcentration } = require('./modules/risk/concentration');
-const { calculatePositionSize } = require('./modules/risk/position-sizer');
 const { adviseBuy, adviseSell, loadLatestSignals } = require('./modules/integration/advisory-engine');
-const { loadData, saveData } = require('./utils/file-helper');
+const { saveData } = require('./utils/file-helper');
 const logger = require('./utils/logger');
 const authMiddleware = require('./middleware/auth');
 const { validateBuyInput, validateSellInput, validateBacktestInput, validatePortfolioInput } = require('./middleware/validate');
@@ -110,7 +109,7 @@ app.post('/api/advisory/sell', validateSellInput, async (req, res) => {
 
 // --- 포트폴리오 리스크 분석 ---
 app.post('/api/risk/portfolio', validatePortfolioInput, async (req, res) => {
-  const { holdings, accountBalance } = req.body;
+  const { holdings } = req.body;
 
   try {
     // 1. 각 종목 일별 수익률 수집 (동시성 제한 병렬)

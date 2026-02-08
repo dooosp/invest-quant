@@ -121,7 +121,7 @@ describe('calculatePositionSize', () => {
     assert.ok(result.kelly, 'Kelly 결과 있어야 함');
     assert.ok(result.atrBased, 'ATR 결과 있어야 함');
     // 최종값은 두 값 중 작은 것 (cap 적용 전)
-    const smaller = Math.min(result.kelly.size, result.atrBased.size);
+    const _smaller = Math.min(result.kelly.size, result.atrBased.size);
     // cap 적용 후이므로 직접 비교 대신 method 확인
     assert.ok(['HALF_KELLY', 'ATR_BASED'].includes(result.method));
   });

@@ -1,6 +1,6 @@
-const logger = require('../../utils/logger');
+const _logger = require('../../utils/logger');
 
-const MOD = 'Strategy';
+const _MOD = 'Strategy';
 
 // =============================================
 // 1. 기술 지표 계산 (auto-trader indicators.js 재현)
@@ -245,7 +245,7 @@ function runBacktest(candles, strategyConfig = {}) {
       const isTakeProfit = profitRate >= takeProfit;
 
       // 분할 매도 체크
-      let partialSold = false;
+      let _partialSold = false;
       for (const level of partialSellLevels) {
         const levelId = `L${Math.round(level.profitRate * 100)}`;
         if (profitRate >= level.profitRate && !position.partialSold.includes(levelId)) {
@@ -262,7 +262,7 @@ function runBacktest(candles, strategyConfig = {}) {
               profitRate: Math.round(profitRate * 10000) / 100,
               reason: `분할매도 +${Math.round(level.profitRate * 100)}%`,
             });
-            partialSold = true;
+            _partialSold = true;
           }
         }
       }

@@ -11,7 +11,7 @@ const MOD = 'VaR';
  * @param {number} confidence - 신뢰수준 (0.95 또는 0.99)
  * @returns {object} { var95, var99, cvar95, cvar99, worstDay, avgReturn }
  */
-function calculateVaR(dailyReturns, confidence = 0.95) {
+function calculateVaR(dailyReturns, _confidence = 0.95) {
   if (!dailyReturns || dailyReturns.length < 20) {
     logger.warn(MOD, `데이터 부족: ${dailyReturns?.length || 0}일 (최소 20일)`);
     return null;

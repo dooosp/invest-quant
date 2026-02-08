@@ -2,7 +2,6 @@
 const logger = require('../utils/logger');
 
 // Express 글로벌 에러 핸들러 (반드시 app.use 마지막에 등록)
-// eslint-disable-next-line no-unused-vars
 module.exports = function errorHandler(err, req, res, _next) {
   logger.error('ErrorHandler', err?.message || 'Unhandled error', err);
 

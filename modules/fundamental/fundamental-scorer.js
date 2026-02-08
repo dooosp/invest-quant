@@ -144,7 +144,7 @@ function scoreValuation(ratios, comparison) {
  * 수익성 점수 (최대 30점)
  * ROE, 영업이익률
  */
-function scoreProfitability(ratios, comparison) {
+function scoreProfitability(ratios, _comparison) {
   let score = 0;
   const reasons = [];
   const max = W.profitability; // 30
