@@ -63,6 +63,15 @@ const config = {
     newsSentimentTTL: 6 * 60 * 60 * 1000, // 6시간
   },
 
+  // Graham Gate 연동 (통과하지 못하면 팩터/리스크 점수와 무관하게 매수 거부)
+  grahamGate: {
+    enabled: process.env.GRAHAM_GATE_ENABLED !== 'false',
+    baseUrl: process.env.INVEST_INTELLIGENCE_URL || process.env.GRAHAM_GATE_URL || 'http://localhost:3000',
+    apiKey: process.env.GRAHAM_GATE_API_KEY || '',
+    timeout: parseInt(process.env.GRAHAM_GATE_TIMEOUT_MS) || 20000,
+    persistSnapshots: process.env.GRAHAM_GATE_PERSIST !== 'false',
+  },
+
   // 섹터 매핑 (auto-trader와 동일)
   sectorMap: {
     '005930': 'TECH',

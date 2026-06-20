@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 const config = require('../../config');
 const { scoreFundamental } = require('../fundamental/fundamental-scorer');
 const { fetchDailyCandles } = require('../backtest/data-collector');
@@ -99,6 +100,67 @@ function loadNewsSentiment(stockCode) {
   return newsSentimentCache.data[stockCode] || null;
 }
 
+async function consultGrahamGate(stockCode, stockName) {
+  const gateConfig = config.grahamGate;
+  if (!gateConfig?.enabled) {
+    return {
+      approved: false,
+      reasonCode: 'GRAHAM_GATE_DISABLED',
+      reason: 'Graham Gate disabled',
+      valueSnapshot: {
+        schemaVersion: 'valueSnapshot.v1',
+        stockCode,
+        stockName,
+        decision: 'REJECT',
+        reasons: ['Graham Gate disabled'],
+        evaluatedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  try {
+    const headers = gateConfig.apiKey ? { 'x-api-key': gateConfig.apiKey } : {};
+    const params = new URLSearchParams();
+    params.set('persist', gateConfig.persistSnapshots ? '1' : '0');
+    if (stockName) params.set('name', stockName);
+
+    const response = await axios.get(
+      `${gateConfig.baseUrl}/api/value/analyze/${encodeURIComponent(stockCode)}?${params.toString()}`,
+      { timeout: gateConfig.timeout || 20000, headers }
+    );
+    const raw = response.data || {};
+    const grahamGate = raw.grahamGate || {};
+    const valueSnapshot = grahamGate.valueSnapshot || raw.valueSnapshot || null;
+    const reasons = grahamGate.reasons || valueSnapshot?.reasons || [];
+    const reason = Array.isArray(reasons) && reasons.length > 0
+      ? reasons.join(', ')
+      : (grahamGate.reason || (grahamGate.passed ? 'Graham Gate passed' : 'Graham Gate failed'));
+
+    return {
+      approved: grahamGate.passed === true,
+      reasonCode: grahamGate.passed ? 'GRAHAM_GATE_PASS' : 'GRAHAM_GATE_REJECT',
+      reason,
+      valueSnapshot,
+      raw,
+    };
+  } catch (error) {
+    const reason = `Graham Gate unavailable: ${error.message}`;
+    return {
+      approved: false,
+      reasonCode: 'GRAHAM_GATE_UNAVAILABLE',
+      reason,
+      valueSnapshot: {
+        schemaVersion: 'valueSnapshot.v1',
+        stockCode,
+        stockName,
+        decision: 'REJECT',
+        reasons: [reason],
+        evaluatedAt: new Date().toISOString(),
+      },
+    };
+  }
+}
+
 /**
  * 매수 종합 자문
  * @param {object} params
@@ -113,10 +175,27 @@ function loadNewsSentiment(stockCode) {
  * @param {number} params.avgWinLossRatio
  */
 async function adviseBuy(params) {
-  const { stockCode, currentPrice, technicalScore, holdings, accountBalance, marketCap, shares, winRate, avgWinLossRatio } = params;
+  const { stockCode, stockName, currentPrice, technicalScore, holdings, accountBalance, marketCap, shares, winRate, avgWinLossRatio } = params;
   const reasons = [];
 
-  // --- 0. 시장 국면 게이트 ---
+  // --- 0. Graham Gate ---
+  const grahamGate = await consultGrahamGate(stockCode, stockName);
+  reasons.push(`Graham Gate: ${grahamGate.approved ? 'PASS' : 'REJECT'} (${grahamGate.reason})`);
+  if (!grahamGate.approved) {
+    logger.info(MOD, `매수 거부: ${stockCode} — ${grahamGate.reason}`);
+    return {
+      approved: false,
+      confidence: 0,
+      fundamentalScore: null,
+      positionSize: null,
+      reasonCode: grahamGate.reasonCode,
+      reason: grahamGate.reason,
+      reasons,
+      valueSnapshot: grahamGate.valueSnapshot,
+    };
+  }
+
+  // --- 1. 시장 국면 게이트 ---
   const regimeInfo = detectRegime();
   const regime = regimeInfo.regime;
   const policy = getPolicy(regime);
@@ -129,10 +208,11 @@ async function adviseBuy(params) {
       regime, positionSize: null,
       reason: `시장 국면 ${regime} — 신규매수 차단`,
       reasons,
+      valueSnapshot: grahamGate.valueSnapshot,
     };
   }
 
-  // --- 1. 펀더멘털 ---
+  // --- 2. 펀더멘털 ---
   let fundamentalScore = null;
   try {
     const fResult = await scoreFundamental(stockCode, marketCap || null, shares || null);
@@ -153,6 +233,7 @@ async function adviseBuy(params) {
       reasonCode: 'FUNDAMENTAL_UNAVAILABLE',
       reason: '펀더멘털 조회 불가 — 안전 거부(수동 확인 필요)',
       reasons,
+      valueSnapshot: grahamGate.valueSnapshot,
     };
   }
 
@@ -163,10 +244,11 @@ async function adviseBuy(params) {
       fundamentalScore, positionSize: null,
       reason: `펀더멘털 ${fundamentalScore}점 < 기준 ${minScore}점`,
       reasons,
+      valueSnapshot: grahamGate.valueSnapshot,
     };
   }
 
-  // --- 2. 리스크 체크 (집중도) ---
+  // --- 3. 리스크 체크 (집중도) ---
   let riskScore = 70; // 기본값
   if (holdings && holdings.length > 0) {
     const holdingsWithValue = holdings.map(h => ({
@@ -186,6 +268,7 @@ async function adviseBuy(params) {
         fundamentalScore, positionSize: null,
         reason: `포트폴리오 집중도 위험 (HHI:${conc.hhi}, ${newSector} 섹터 ${sectorPct}%)`,
         reasons: [...reasons, `집중도 ${conc.level}`],
+        valueSnapshot: grahamGate.valueSnapshot,
       };
     }
 
@@ -194,7 +277,7 @@ async function adviseBuy(params) {
     else riskScore = 85;
   }
 
-  // --- 2b. 팩터 랭크 게이트 (신선도 + 화이트리스트) ---
+  // --- 4. 팩터 랭크 게이트 (신선도 + 화이트리스트) ---
   let factorRank = null;
   let factorScore = null;
   const signals = loadLatestSignals();
@@ -208,6 +291,7 @@ async function adviseBuy(params) {
         positionSize: null, reasonCode: 'SIGNAL_TOO_OLD',
         reason: `파이프라인 시그널 ${signals.ageHours}시간 경과 (기준: ${maxAge}h) — 재실행 필요`,
         reasons: [...reasons, `시그널 경과: ${signals.ageHours}h`],
+        valueSnapshot: grahamGate.valueSnapshot,
       };
     }
     if (signals.ageHours > maxAge / 2) {
@@ -225,6 +309,7 @@ async function adviseBuy(params) {
           positionSize: null, reasonCode: 'NOT_IN_WHITELIST',
           reason: `화이트리스트 미포함 (${signals.whitelist.length}종목 중 제외)`,
           reasons: [...reasons, '화이트리스트 미포함'],
+          valueSnapshot: grahamGate.valueSnapshot,
         };
       }
       reasons.push(`화이트리스트 포함 (${signals.whitelist.length}종목)`);
@@ -245,7 +330,7 @@ async function adviseBuy(params) {
     }
   }
 
-  // --- 3. 포지션 사이징 ---
+  // --- 5. 포지션 사이징 ---
   let positionSize = null;
   if (accountBalance && currentPrice) {
     const candles = await fetchDailyCandles(stockCode, 60).catch(() => []);
@@ -261,7 +346,7 @@ async function adviseBuy(params) {
     if (sizing.reasons) reasons.push(...sizing.reasons);
   }
 
-  // --- 4. 뉴스 센티먼트 ---
+  // --- 6. 뉴스 센티먼트 ---
   let newsScore = 50; // 기본값 (중립)
   const newsData = loadNewsSentiment(stockCode);
   if (newsData) {
@@ -269,7 +354,7 @@ async function adviseBuy(params) {
     reasons.push(`뉴스 센티먼트: ${newsData.sentiment || 'N/A'} (${newsScore}점)`);
   }
 
-  // --- 5. 종합 신뢰도 ---
+  // --- 7. 종합 신뢰도 ---
   const fNorm = fundamentalScore != null ? fundamentalScore : 50;
   const tNorm = technicalScore != null ? technicalScore : 50;
   const newsWeight = WEIGHTS.news || 0;
@@ -277,13 +362,14 @@ async function adviseBuy(params) {
     fNorm * WEIGHTS.fundamental + tNorm * WEIGHTS.technical + riskScore * WEIGHTS.risk + newsScore * newsWeight
   );
 
-  // --- 6. 국면별 매수 게이트 (RESTRICTED 체크) ---
+  // --- 8. 국면별 매수 게이트 (RESTRICTED 체크) ---
   const gateResult = checkBuyGate(regime, confidence);
   if (!gateResult.allowed) {
     logger.info(MOD, `매수 거부: ${stockCode} — ${gateResult.reason}`);
     return {
       approved: false, confidence, fundamentalScore, factorRank, factorScore,
       regime, positionSize: null, reason: gateResult.reason, reasons,
+      valueSnapshot: grahamGate.valueSnapshot,
     };
   }
 
@@ -304,6 +390,7 @@ async function adviseBuy(params) {
     newsScore,
     regime,
     positionSize,
+    valueSnapshot: grahamGate.valueSnapshot,
     reason: `종합 신뢰도 ${confidence}점 (펀더멘털 ${fNorm}×${WEIGHTS.fundamental} + 기술 ${tNorm}×${WEIGHTS.technical} + 리스크 ${riskScore}×${WEIGHTS.risk} + 뉴스 ${newsScore}×${newsWeight}) [${regime}]`,
     reasons,
   };
